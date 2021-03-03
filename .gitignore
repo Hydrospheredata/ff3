@@ -1,0 +1,9 @@
+.eggs
+.ipynb_checkpoints
+.metals
+.pytest_cache
+.vscode
+*.egg-info 
+
+data
+venv
