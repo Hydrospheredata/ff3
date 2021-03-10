@@ -38,6 +38,8 @@ a bivariate report.
 drift.bivariate_report("passenger_count", "tip_amount")
 ```
 
+![img](docs/resources/bivariate_report.png)
+
 You can de/serialize DriftReport instance if required. 
 
 ```python
