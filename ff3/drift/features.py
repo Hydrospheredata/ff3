@@ -6,12 +6,13 @@ from enum import Enum
 import pandas as pd
 import numpy as np
 from scipy import stats
+from sklearn.preprocessing import KBinsDiscretizer, LabelEncoder
 
 from ff3.drift.test import (
     StatisticalTest, mean_test_message, median_test_message, 
     variance_test_message, chi_square_message, unique_values_test_message
 )
-from ff3.drift.utils import is_evaluated
+from ff3.drift.utils import is_evaluated, not_restored
 
 
 class ProfileTypes(Enum):
@@ -21,28 +22,27 @@ class ProfileTypes(Enum):
 
 
 class FeatureReportFactory:
-
     @classmethod
     def create(cls, name: str, s1: pd.Series, s2: pd.Series, p_threshold: float) -> 'FeatureReport':
-        if cls.is_categorical(s1):
+        if cls.__is_categorical(s1):
             logging.info(f"Feature {name} is inferred as Categorical.")
             return CategoricalFeatureReport(name, s1.values, s2.values, p_threshold)
-        elif cls.is_numerical(s1):
+        elif cls.__is_numerical(s1):
             logging.info(f"Feature {name} is inferred as Numerical.")
             return NumericalFeatureReport(name, s1.values, s2.values, p_threshold)
         else:
             logging.info(f"Couldn't infer profile type of feature {name}.")
             return UnknownFeatureReport(name, s1.values, s2.values, p_threshold)
 
-    @classmethod
-    def is_categorical(cls, sr: pd.Series) -> bool:
+    @staticmethod
+    def __is_categorical(sr: pd.Series) -> bool:
         is_categorical = pd.api.types.is_categorical_dtype(sr)
         unique_values = sr.value_counts().shape[0]
         is_categorical_fallback = unique_values / sr.shape[0] <= 0.05 and unique_values <= 20
         return is_categorical or is_categorical_fallback
 
-    @classmethod
-    def is_numerical(cls, sr: pd.Series) -> bool:
+    @staticmethod
+    def __is_numerical(sr: pd.Series) -> bool:
         return pd.api.types.is_numeric_dtype(sr)
 
     @staticmethod
@@ -57,25 +57,43 @@ class FeatureReportFactory:
         
 class FeatureReport(ABC):
     def __init__(self, name: str, a1: np.array, a2: np.array, p_threshold: float):
-        logging.info(f"Creating a report for {name}")
-        self.name = name
-        self.a1, self.a2 = a1, a2
-        self.tests = []
         self._is_evaluated = False
+        self._is_restored = False
+
+        self.name = name
+        self.a1 = a1
+        self.a2 = a2
+        self.tests = []
         self.drift_probability = 0
         self.p_threshold = p_threshold
 
-        # Calculate bins to visualize histograms on UI
-        self.bins, self.a1_hist_values, self.a2_hist_values = self._get_histogram()
-        self.bivariate_reports: List[BivariateFeatureReport] = []
+        self.bins = []
+        self.a1_hist_values = []
+        self.a2_hist_values = []
 
     def __repr__(self):
         return f"Feature report for {self.name}"
 
+    def _prepare(self):
+        self.bins, self.a1_hist_values, self.a2_hist_values = self._get_histogram()
+    
+    def _combine(self, other: 'FeatureReport'):
+        """
+        Combine two statistical feature reports from submitted features respectively 
+        to calculate the conditional distribution X2|X1.
+        """
+        return BivariateReportFactory.create(self, other)
+
+    @abstractmethod
+    def _get_histogram(self) -> Tuple[np.array, np.array, np.array]:
+        """
+        Create a histogram for the given feature report.
+        """
+        pass
+
+    @not_restored
     def eval(self):
-        logging.info(f"Calculating features for {self.name}")
-        for bv in self.bivariate_reports:
-            bv.eval()
+        self._prepare()
 
     @is_evaluated
     def to_dict(self) -> dict:
@@ -92,7 +110,6 @@ class FeatureReport(ABC):
             "drift_probability": self.drift_probability,
             "p_threshold": self.p_threshold,
         }
-        # "bivariate_reports": [r.to_dict() for r in self.bivariate_reports]}
     
     @property
     @is_evaluated
@@ -110,33 +127,11 @@ class FeatureReport(ABC):
             return {"drift_probability_per_feature": self.drift_probability,
                     "message": f"The feature {self.name} has drifted. Following statistics have changed: {[x.name for x in self.tests if x.has_changed]}."}
 
-    def combine(self, other: 'FeatureReport'):
-        """
-        Combine two statistical feature reports from features x1 and x2 respectively to calculate conditional
-        distribution X2|X1.
-
-        Parameters
-        ----------
-        another FeatureReport
-
-        Returns
-        -------
-        """
-        self.bivariate_reports.append(BivariateReportFactory.create(self, other))
-
-    @abstractmethod
-    def _get_histogram(self) -> Tuple[np.array, np.array, np.array]:
-        """
-
-        Returns
-        -------
-        (bins, a1 PMF values, a2 PMF values)
-        """
-        pass
-
     @classmethod
     def from_dict(cls, name: str, in_dict: dict) -> 'FeatureReport':
         instance = cls(name, None, None, in_dict["p_threshold"])
+        instance._is_evaluated = True
+        instance._is_restored = True
         instance.bins = in_dict["hist"]["bins"]
         instance.a1_hist_values = in_dict["hist"]["a1"]
         instance.a2_hist_values = in_dict["hist"]["a2"]
@@ -153,13 +148,13 @@ class UnknownFeatureReport(FeatureReport):
         super().__init__(name, a1, a2, p_threshold)
         self._is_evaluated = True
 
-    def _get_histogram(self):
-        return [], [], []
-
     def to_dict(self):
         result = super().to_dict()
         result.update({"profile": ProfileTypes.UNKNOWN.value})
         return result
+    
+    def _get_histogram(self):
+        return [], [], []
 
 
 class NumericalFeatureReport(FeatureReport):
@@ -173,6 +168,7 @@ class NumericalFeatureReport(FeatureReport):
             StatisticalTest("Variance", np.var, stats.levene, variance_test_message, self.p_threshold, {"center": "mean"}),
         ]
 
+    @not_restored
     def eval(self):
         super().eval()
         for test in self.tests:
@@ -280,12 +276,11 @@ class CategoricalFeatureReport(FeatureReport):
 
 
 class BivariateReportFactory:
-    
     @classmethod
-    def create(cls, r1: FeatureReport, r2: FeatureReport):
+    def create(cls, fr1: FeatureReport, fr2: FeatureReport):
         return BivariateFeatureReport(
-            r1.feature_name, *cls.__encode_feature_report(r1),
-            r2.feature_name, *cls.__encode_feature_report(r2)
+            fr1.name, *cls.__encode_feature_report(fr1),
+            fr2.name, *cls.__encode_feature_report(fr2)
         )
 
     @classmethod
@@ -301,21 +296,6 @@ class BivariateReportFactory:
 
     @staticmethod
     def __encode_categorical_report(feature_report: 'CategoricalFeatureReport'):
-        """
-        use OrdinalEncoder to encode categories into ints
-
-        Parameters
-        ----------
-        feature_report
-
-        Returns
-        -------
-        tuple:
-        * List of labels used in human readable form e.g. ["Cat", "Dog", ..., "Frog"]
-        * Ordinally encoded a1 data
-        * Ordinally encoded a2 data
-        """
-
         labels = feature_report.bins
 
         encoder = LabelEncoder()
@@ -327,15 +307,6 @@ class BivariateReportFactory:
 
     @staticmethod
     def __discretize_numerical_report(feature_report: NumericalFeatureReport):
-        """
-        Returns
-        -------
-        tuple:
-
-        * List of labels used in human readable form e.g. ["<10", "10-15", ..., ">100"]
-        * Ordinally encoded binned a1 data
-        * Ordinally encoded binned a2 data
-        """
         bin_edges = feature_report.bins
 
         discretizer = KBinsDiscretizer(encode='ordinal', strategy='uniform')
@@ -363,8 +334,6 @@ class BivariateFeatureReport:
         f2_a1: Ordinally encoded array of a1 labels from the second feature
         f2_a2: Ordinally encoded array of a2 labels from the second feature
         """
-        logging.info(f"Creating bivariate report between {f1_name} and {f2_name}")
-
         self.f1_name = f1_name
         self.f1_labels = f1_labels
         self.f1_a1 = f1_a1
@@ -375,7 +344,6 @@ class BivariateFeatureReport:
         self.f2_a1 = f2_a1
         self.f2_a2 = f2_a2
 
-        # Calculate in self.process()
         self.a1_heatmap: HeatMapData = None
         self.a2_heatmap: HeatMapData = None
 
@@ -397,24 +365,15 @@ class BivariateFeatureReport:
                                       x_labels=self.f1_labels, y_labels=self.f2_labels,
                                       x=self.f1_a2, y=self.f2_a2)
         self._is_evaluated = True
-    
-    @is_evaluated
-    def to_dict(self):
-        return {"feature_1": self.f1_name,
-                "feature_2": self.f2_name,
-                "drifted": self.drifted,
-                "a1_heatmap": self.a1_heatmap.to_dict(),
-                "a2_heatmap": self.a2_heatmap.to_dict()}
 
 
 class HeatMapData:
-
     def __init__(self, x_title: str, y_title: str,
                  x_labels: np.array, y_labels: np.array,
                  x: np.array, y: np.array):
         """
-        Container for heatmap data to plot on the UI. Calculates densities between ordinally encoded labels
-        in x and y correspondingly
+        Container for heatmap data to plot on the UI. Calculates densities between 
+        ordinally encoded labels in x and y correspondingly
         Parameters
         ----------
         x_title x axis name
@@ -431,9 +390,8 @@ class HeatMapData:
         self.x = x
         self.y = y
 
-        intensity_list = []
-
         # Computes heatmap density
+        intensity_list = []
         for ordinal_label_y, _ in enumerate(y_labels):
             for ordinal_label_x, _ in enumerate(x_labels):
                 x_mask = x == ordinal_label_x
@@ -445,11 +403,3 @@ class HeatMapData:
                 intensity_list.append(intensity)
 
         self.intensity = np.array(intensity_list).reshape(len(y_labels), len(x_labels))
-
-    def to_dict(self):
-        return {"x_axis_name": self.x_title,
-                "y_axis_name": self.y_title,
-                "x": self.x_labels.tolist(),
-                "y": self.y_labels.tolist(),
-                "density": self.intensity.tolist()}
-

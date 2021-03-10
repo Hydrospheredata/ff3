@@ -4,6 +4,7 @@
 .pytest_cache
 .vscode
 *.egg-info 
+**/__pycache__/*
 
 data
 venv
