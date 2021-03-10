@@ -2,7 +2,7 @@ import logging
 import itertools
 import json
 from typing import List, Optional
-
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 
@@ -17,25 +17,42 @@ class DriftReport:
             d1: pd.DataFrame, 
             d2: pd.DataFrame, 
             p_threshold: float = .01, 
-            skipcols: Optional[List[str]] = None
+            skipcols: Optional[List[str]] = None,
+            keepcols: Optional[List[str]] = None,
     ):
+        """
+        :param d1: pd.DataFrame to use for a statistical report.
+        :param d2: pd.DataFrame to use for a statistical report.
+        :param p_threshold: P-threshold to use in statistical tests.
+        :param skipcols: List of column names, which should be ignored for processing.
+        :param keepcols: List of column names, only which should be considered for processing.
+            If empty, all columns are considered except ones, specified in skipcols. 
+        """
         self._is_evaluated = False   # are defined tests evaluated?
         self._is_restored = False    # is self instance restored from a serialization format?
 
         self.p_threshold = p_threshold
         self.d1 = d1
         self.d2 = d2
-        self.skipcols = skipcols or []
+        self.skipcols = set(skipcols) if skipcols is not None else set()
+        self.keepcols = set(keepcols) if keepcols is not None else set()
 
     def __repr__(self):
         return "DriftReport"
 
+    @lru_cache(maxsize=1)
+    def _get_columns(self):
+        candidates = common_columns(self.d1, self.d2).difference(self.skipcols)
+        if len(self.keepcols) > 0:
+            return candidates.intersection(self.keepcols)
+        return candidates
+        
     def _validate(self):
         """
         Validate submitted datasets for correctness.
         """
         logging.info("Validating datasets for correctness")
-        if len(common_columns(self.d1, self.d2).difference(set(self.skipcols))) == 0:
+        if len(self._get_columns()) == 0:
             raise ValidationError("Couldn't find common columns between datasets to create a useful report")
 
     def _prepare(self):
@@ -49,7 +66,7 @@ class DriftReport:
         logging.info("Creating feature report definitions")
         self.feature_reports = {
             name : FeatureReportFactory.create(name, self.d1[name], self.d2[name], self.p_threshold) 
-            for name in common_columns(self.d1, self.d2).difference(set(self.skipcols))
+            for name in self._get_columns()
         }
 
     @not_restored
